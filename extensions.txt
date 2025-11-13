@@ -1,0 +1,18 @@
+[local-incoming]
+; extension for 1001
+exten => 1001,1,NoOp(Call received on 1001)
+ same => n,Verbose(Hello World from 1001!)
+ same => n,Answer()
+ same => n,Playback(demo-congrats) ; optional audio
+ same => n,Hangup()
+
+; extension for 1002
+exten => 1002,1,NoOp(Call received on 1002)
+ same => n,Verbose(Hello World from 1002!)
+ same => n,Answer()
+ same => n,Playback(demo-congrats) ; optional audio
+ same => n,Hangup()
+
+exten => 5000,1,Answer()
+ same => n,Stasis(voicebot)
+ same => n,Hangup()
