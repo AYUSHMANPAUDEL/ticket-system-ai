@@ -62,6 +62,20 @@ sudo nano /etc/asterisk/extensions.conf
 ```
 paste the content of `extensions.txt`
 
+## http config
+```bash
+sudo mv /etc/asterisk/http.conf /etc/asterisk/http.conf.backup
+sudo nano /etc/asterisk/http.conf
+```
+paste the content of http.txt!
+
+## ari config
+```bash
+sudo mv /etc/asterisk/ari.conf /etc/asterisk/ari.conf.backup
+sudo nano /etc/asterisk/ari.conf
+```
+paste the content of ari.txt 
+
 # Install Linphone
 Install Linphone from the link https://www.linphone.org/en/download/
 
