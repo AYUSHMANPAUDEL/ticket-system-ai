@@ -76,6 +76,10 @@ sudo nano /etc/asterisk/ari.conf
 ```
 paste the content of ari.txt 
 
+## voicebot js prep
+sudo nano /opt/voicebot/voicebot.js
+paste the file content of voicebot.js
+
 # Install Linphone
 Install Linphone from the link https://www.linphone.org/en/download/
 
@@ -90,6 +94,7 @@ set that as domain
 usernames = 1001 , 1002
 
 passwords = 1234, 1234
+
 
 
 
