@@ -67,3 +67,7 @@
 [DEBUG] queueing silence prompt to ollama_queue: Hello? Are you still there? I can't hear you.
 [DEBUG] silence prompt queued
 📊 RTP: 957 pkts, queue: 0
+
+
+
+pip install SpeechRecognition pyttsx3 pyaudio numpy requests
