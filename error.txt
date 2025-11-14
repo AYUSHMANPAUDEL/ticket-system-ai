@@ -1,0 +1,69 @@
+🔕 SILENCE DETECTED - Prompting user
+🤖 AI: "I'm having trouble hearing you. Are you there?"
+============================================================
+🔊 [DEBUG] Speech enabled; remote_addr=('192.168.1.55', 64532)
+🚦 [DEBUG] Set ai_speaking flag
+🔊 Generating speech from assistant reply...
+🔊 [TTS] Request text (46 chars): I'm having trouble hearing you. Are you there?
+🎵 [TTS] Trying Windows SAPI...
+✅ [TTS] SAPI returned 134246 bytes @ 22050Hz
+   (TTS generation took 0.07s)
+📤 Enqueueing 134246 bytes at 22050Hz for ('192.168.1.55', 64532) (pt_hint=0)
+   Resampled to 8kHz: 48706 bytes
+   Encoded to PCMU: 24353 bytes
+   ✅ Queued 153 frames (3060ms)
+📤 [DEBUG] Enqueued 153 frames to RTP queue
+✅ Playing (queued) 3.1s of audio; waiting 4.6s for sender to transmit
+🎯 Starting new audio sequence (marker bit set)
+📨 RTP: sent non-silence packet #350, queue=151
+📨 RTP: sent non-silence packet #400, queue=101
+[THREADS] transcribe_worker: alive | llm_worker: alive | thread_health_monitor: alive | rtp_sender_('192.168.1.55', 64532): alive
+📨 RTP: sent non-silence packet #450, queue=51
+📨 RTP: sent non-silence packet #500, queue=1
+✅ Audio queue emptied after 3.2s
+✅ Audio finished sending
+🚦 [DEBUG] Cleared ai_speaking flag
+🔄 [DEBUG] LLM task done
+🔄 [DEBUG] LLM worker waiting for messages...
+
+🎤 User speaking...
+📝 Processing speech (0.7s)...
+[DEBUG] Putting audio into transcribe_queue
+[DEBUG] Audio queued for transcription
+
+🎤 User speaking...
+🔄 [DEBUG] LLM worker waiting for messages...
+🔄 [DEBUG] LLM worker waiting for messages...
+⚠️  No speech detected in audio (1.0s)
+🔄 [DEBUG] LLM worker waiting for messages...
+📝 Processing speech (2.7s)...
+[DEBUG] Putting audio into transcribe_queue
+[DEBUG] Audio queued for transcription
+
+🎤 User speaking...
+🔄 [DEBUG] LLM worker waiting for messages...
+📝 Processing speech (0.5s)...
+[DEBUG] Putting audio into transcribe_queue
+[DEBUG] Audio queued for transcription
+
+✅ TRANSCRIBED: "Hello can you hear me?"
+   (Transcription took 0.7s)
+📤 [DEBUG] Putting 'Hello can you hear me?' into ollama_queue (current size: 0)...
+✅ [DEBUG] Message queued! New queue size: 1
+🔔 [DEBUG] Received message from queue: 'Hello can you hear me?'
+
+============================================================
+👤 USER: "Hello can you hear me?"
+============================================================
+⚠️  No speech detected in audio (0.6s)
+📊 RTP: 589 pkts, queue: 0
+[THREADS] transcribe_worker: alive | llm_worker: alive | thread_health_monitor: alive | rtp_sender_('192.168.1.55', 64532): alive
+⏰ User silent for 8.0s, prompting...
+[DEBUG] queueing silence prompt to ollama_queue: Hey, I didn't catch that. Can you speak up?
+[DEBUG] silence prompt queued
+📊 RTP: 777 pkts, queue: 0
+[THREADS] transcribe_worker: alive | llm_worker: alive | thread_health_monitor: alive | rtp_sender_('192.168.1.55', 64532): alive
+⏰ User silent for 20.0s, prompting...
+[DEBUG] queueing silence prompt to ollama_queue: Hello? Are you still there? I can't hear you.
+[DEBUG] silence prompt queued
+📊 RTP: 957 pkts, queue: 0
