@@ -77,9 +77,8 @@ VAD_FRAME_MS = 20
 VAD_FRAME_SAMPLES = RECV_SAMPLE_RATE * VAD_FRAME_MS // 1000
 MIN_SPEECH_FRAMES = 5
 SPEECH_THRESHOLD = 0.012
-SILENCE_FRAMES = 25  # Increased to wait longer for user to finish
+SILENCE_FRAMES = 150  # 3 seconds of silence (150 frames * 20ms = 3000ms)
 MIN_AUDIO_LENGTH_SEC = 0.5
-TRANSCRIBE_COOLDOWN = 0.5
 
 # -----------------------------
 # Global state
@@ -97,11 +96,9 @@ speech_buffer = []
 speech_frame_count = 0
 silence_frame_count = 0
 is_speaking = False
-last_transcribe_time = 0
+is_processing = False  # Flag to prevent concurrent processing
 
-transcribe_queue = Queue(maxsize=8)
 transcribe_lock = threading.Lock()
-ollama_queue = Queue(maxsize=16)
 conversation_history = [{"role": "system", "content": SYSTEM_PROMPT}]
 history_lock = threading.Lock()
 
@@ -216,15 +213,118 @@ def resample_any_to_8k(pcm16_bytes, src_rate):
 # -----------------------------
 # VAD and transcription pipeline
 # -----------------------------
+def process_user_speech(audio_data):
+    """Process user speech: transcribe, get AI response, speak it back"""
+    global is_processing, remote_addr, peer_fmt_pt
+    
+    try:
+        audio_duration = len(audio_data) / (RECV_SAMPLE_RATE * 2)
+        print(f"\n📝 Processing {audio_duration:.1f}s of user speech...")
+        
+        # Transcribe with Whisper
+        audio_16k = resample_8k_to_16k(audio_data)
+        samples = np.frombuffer(audio_16k, dtype=np.int16).astype(np.float32) / 32768.0
+        
+        start_time = time.time()
+        with transcribe_lock:
+            result = whisper_model.transcribe(
+                samples,
+                task=WHISPER_TASK,
+                fp16=False,
+                language="en",
+                beam_size=1,
+                best_of=1,
+                temperature=0.0
+            )
+        elapsed = time.time() - start_time
+        
+        text = result.get("text", "").strip()
+        if not text:
+            print(f"⚠️  No speech detected ({elapsed:.1f}s)")
+            return
+        
+        print(f"✅ TRANSCRIBED: \"{text}\" ({elapsed:.1f}s)")
+        
+        # Add to conversation history
+        with history_lock:
+            conversation_history.append({"role": "user", "content": text})
+            prune_history()
+            snapshot = list(conversation_history)
+        
+        # Get AI response
+        print("🤔 Getting AI response...")
+        start_time = time.time()
+        assistant_reply = call_ollama(snapshot)
+        elapsed = time.time() - start_time
+        
+        if not assistant_reply:
+            print("⚠️ Empty response from AI")
+            return
+        
+        print(f"🤖 AI: \"{assistant_reply}\" ({elapsed:.1f}s)")
+        
+        # Add AI response to history
+        with history_lock:
+            conversation_history.append({"role": "assistant", "content": assistant_reply})
+            prune_history()
+        
+        # Convert to speech and play
+        if SPEAK_ASSISTANT and remote_addr:
+            ai_speaking.set()
+            ai_should_stop.clear()
+            
+            try:
+                pcm, rate = text_to_speech(assistant_reply)
+                
+                if pcm:
+                    frames = enqueue_rtp_audio_from_pcm16(remote_addr, pcm, rate, peer_fmt_pt)
+                    
+                    if frames > 0:
+                        speech_duration = frames * 0.02
+                        wait_time = speech_duration + 0.5
+                        print(f"🔊 Speaking... ({speech_duration:.1f}s)")
+                        
+                        start_wait = time.time()
+                        while time.time() - start_wait < wait_time:
+                            if ai_should_stop.is_set():
+                                print("⏸️  Speech interrupted")
+                                break
+                            
+                            try:
+                                if remote_addr in injection_queues:
+                                    qsize = injection_queues[remote_addr].qsize()
+                                    if qsize == 0 and time.time() - start_wait > 0.5:
+                                        break
+                            except Exception:
+                                pass
+                            time.sleep(0.1)
+                        
+                        print("✅ Speech complete\n")
+                else:
+                    print("❌ TTS failed")
+            except Exception as e:
+                print("❌ TTS error:", e)
+                traceback.print_exc()
+            finally:
+                ai_speaking.clear()
+                ai_should_stop.clear()
+                
+    except Exception as e:
+        print(f"❌ Error processing user speech: {e}")
+        traceback.print_exc()
+    finally:
+        is_processing = False
+
+
 def process_audio_vad(pcm8k_bytes):
-    global speech_buffer, speech_frame_count, silence_frame_count, is_speaking, last_transcribe_time
+    global speech_buffer, speech_frame_count, silence_frame_count, is_speaking, is_processing
+    
     try:
         if len(pcm8k_bytes) < VAD_FRAME_SAMPLES * 2:
             return
-        current_time = time.time()
         
-        # Don't process audio while AI is speaking (unless interrupted)
-        if ai_speaking.is_set() and not ai_should_stop.is_set():
+        # Don't process while AI is speaking or already processing
+        if ai_speaking.is_set() or is_processing:
             return
 
         for i in range(0, len(pcm8k_bytes), VAD_FRAME_SAMPLES * 2):
@@ -240,10 +340,10 @@ def process_audio_vad(pcm8k_bytes):
                     speech_frame_count = 0
                     silence_frame_count = 0
                     speech_buffer = []
-                    print(f"\n🎤 User speaking... (RMS: {rms:.4f})")
+                    print(f"\n🎤 User speaking...")
                     if ai_speaking.is_set():
                         ai_should_stop.set()
-                        print("⏸️  [AI interrupted by user]")
+                        print("⏸️  [AI interrupted]")
                 speech_buffer.append(frame)
                 speech_frame_count += 1
                 silence_frame_count = 0
@@ -253,70 +353,42 @@ def process_audio_vad(pcm8k_bytes):
                     silence_frame_count += 1
                     speech_buffer.append(frame)
                     
-                    # User stopped speaking - send for transcription
+                    # User stopped speaking (3 seconds silence) - process immediately
                     if silence_frame_count >= SILENCE_FRAMES:
                         if speech_frame_count >= MIN_SPEECH_FRAMES:
-                            if current_time - last_transcribe_time >= TRANSCRIBE_COOLDOWN:
-                                audio_data = b''.join(speech_buffer)
-                                audio_duration = len(audio_data) / (RECV_SAMPLE_RATE * 2)
-                                if audio_duration >= MIN_AUDIO_LENGTH_SEC:
-                                    print(f"📝 User stopped speaking ({audio_duration:.1f}s), transcribing...")
-                                    audio_16k = resample_8k_to_16k(audio_data)
-                                    try:
-                                        transcribe_queue.put_nowait(audio_16k)
-                                        last_transcribe_time = current_time
-                                    except Full:
-                                        print("⚠️  Transcription queue full, skipping...")
-                                else:
-                                    print(f"⏭️  Speech too short ({audio_duration:.1f}s), ignored")
-                        is_speaking = False
-                        speech_buffer = []
-                        speech_frame_count = 0
-                        silence_frame_count = 0
+                            audio_data = b''.join(speech_buffer)
+                            audio_duration = len(audio_data) / (RECV_SAMPLE_RATE * 2)
+                            if audio_duration >= MIN_AUDIO_LENGTH_SEC:
+                                is_processing = True
+                                is_speaking = False
+                                speech_buffer = []
+                                speech_frame_count = 0
+                                silence_frame_count = 0
+                                
+                                # Process in a new thread so VAD continues
+                                threading.Thread(
+                                    target=process_user_speech,
+                                    args=(audio_data,),
+                                    daemon=True
+                                ).start()
+                            else:
+                                print(f"⏭️  Speech too short ({audio_duration:.1f}s)")
+                                is_speaking = False
+                                speech_buffer = []
+                                speech_frame_count = 0
+                                silence_frame_count = 0
+                        else:
+                            is_speaking = False
+                            speech_buffer = []
+                            speech_frame_count = 0
+                            silence_frame_count = 0
     except Exception as e:
         print("❌ process_audio_vad error:", e)
         traceback.print_exc()
 
 def transcribe_worker():
-    print("🎯 Transcription worker ready")
-    register_thread("transcribe_worker", threading.current_thread())
-    while not shutting_down.is_set():
-        try:
-            pcm16_bytes = transcribe_queue.get(timeout=0.5)
-        except Empty:
-            continue
-        try:
-            samples = np.frombuffer(pcm16_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-            start_time = time.time()
-            with transcribe_lock:
-                result = whisper_model.transcribe(
-                    samples,
-                    task=WHISPER_TASK,
-                    fp16=False,
-                    language="en",
-                    beam_size=1,
-                    best_of=1,
-                    temperature=0.0
-                )
-            elapsed = time.time() - start_time
-            text = result.get("text", "").strip()
-            if text:
-                print(f"\n✅ TRANSCRIBED: \"{text}\" ({elapsed:.1f}s)")
-                try:
-                    ollama_queue.put_nowait(text)
-                    print(f"📤 Sent to AI (queue size: {ollama_queue.qsize()})")
-                except Full:
-                    print("⚠️  AI queue full, dropping message")
-            else:
-                print(f"⚠️  No speech detected ({elapsed:.1f}s)")
-        except Exception as e:
-            print(f"❌ Transcription error: {e}")
-            traceback.print_exc()
-        finally:
-            try:
-                transcribe_queue.task_done()
-            except Exception:
-                pass
+    """Deprecated - kept for compatibility"""
+    pass
 
 # -----------------------------
 # TTS helpers
@@ -700,114 +772,48 @@ def prune_history():
             del conversation_history[1:1 + len(non_system) - MAX_HISTORY_MESSAGES]
 
 # -----------------------------
-# LLM worker
+# Greeting handler
 # -----------------------------
-def llm_worker():
+def send_greeting():
+    """Send AI-generated greeting when user connects"""
     global remote_addr, peer_fmt_pt
-    print("🤖 AI assistant worker ready")
-    register_thread("llm_worker", threading.current_thread())
     
-    while not shutting_down.is_set():
-        try:
-            user_text = ollama_queue.get(timeout=0.5)
-        except Empty:
-            continue
+    try:
+        print("👋 Generating AI greeting...")
+        greeting_prompt = "[SYSTEM: User just connected. Generate a warm, brief greeting (1-2 sentences) introducing yourself and offering to help.]"
+        temp_messages = list(conversation_history) + [{"role": "user", "content": greeting_prompt}]
+        
+        assistant_reply = call_ollama(temp_messages)
+        
+        if not assistant_reply:
+            assistant_reply = "Hello! I'm your AI assistant. How can I help you today?"
+        
+        print(f"🤖 Greeting: \"{assistant_reply}\"")
+        
+        # Speak the greeting
+        if SPEAK_ASSISTANT and remote_addr:
+            ai_speaking.set()
+            try:
+                pcm, rate = text_to_speech(assistant_reply)
+                if pcm:
+                    frames = enqueue_rtp_audio_from_pcm16(remote_addr, pcm, rate, peer_fmt_pt)
+                    if frames > 0:
+                        speech_duration = frames * 0.02
+                        print(f"🔊 Speaking greeting... ({speech_duration:.1f}s)")
+                        time.sleep(speech_duration + 0.5)
+                        print("✅ Greeting complete\n")
+            except Exception as e:
+                print(f"❌ Greeting error: {e}")
+            finally:
+                ai_speaking.clear()
+    except Exception as e:
+        print(f"❌ Error sending greeting: {e}")
+        traceback.print_exc()
 
-        try:
-            if not isinstance(user_text, str) or not user_text.strip():
-                ollama_queue.task_done()
-                continue
 
-            # Check if it's a system prompt (greeting)
-            is_greeting = "[SYSTEM:" in user_text
-            
-            if is_greeting:
-                print("\n" + "=" * 60)
-                print("👋 GENERATING GREETING")
-                print("=" * 60)
-                # Generate greeting without adding to history
-                temp_messages = list(conversation_history) + [{"role": "user", "content": user_text}]
-                assistant_reply = call_ollama(temp_messages)
-            else:
-                # Normal user message
-                print("\n" + "=" * 60)
-                print(f"👤 USER: \"{user_text}\"")
-                print("=" * 60)
-                
-                # Add to conversation history
-                with history_lock:
-                    conversation_history.append({"role": "user", "content": user_text})
-                    prune_history()
-                    snapshot = list(conversation_history)
-                
-                # Get AI response
-                start_time = time.time()
-                assistant_reply = call_ollama(snapshot)
-                elapsed = time.time() - start_time
-                
-                if not assistant_reply:
-                    print("⚠️ Empty response from AI")
-                    ollama_queue.task_done()
-                    continue
-                
-                print(f"🤖 AI: \"{assistant_reply}\" ({elapsed:.1f}s)")
-                
-                # Add AI response to history
-                with history_lock:
-                    conversation_history.append({"role": "assistant", "content": assistant_reply})
-                    prune_history()
-
-            # Convert AI response to speech and send via RTP
-            if SPEAK_ASSISTANT and remote_addr and assistant_reply:
-                ai_speaking.set()
-                ai_should_stop.clear()
-                
-                try:
-                    # Generate TTS
-                    pcm, rate = text_to_speech(assistant_reply)
-                    
-                    if pcm:
-                        # Enqueue audio
-                        frames = enqueue_rtp_audio_from_pcm16(remote_addr, pcm, rate, peer_fmt_pt)
-                        
-                        if frames > 0:
-                            # Wait for audio to finish playing
-                            speech_duration = frames * 0.02
-                            wait_time = speech_duration + 0.5
-                            print(f"🔊 Speaking... ({speech_duration:.1f}s)")
-                            
-                            start_wait = time.time()
-                            while time.time() - start_wait < wait_time:
-                                if ai_should_stop.is_set():
-                                    print("⏸️  Speech interrupted")
-                                    break
-                                
-                                # Check if queue is empty (audio finished)
-                                try:
-                                    if remote_addr in injection_queues:
-                                        qsize = injection_queues[remote_addr].qsize()
-                                        if qsize == 0 and time.time() - start_wait > 0.5:
-                                            break
-                                except Exception:
-                                    pass
-                                time.sleep(0.1)
-                            
-                            print("✅ Speech complete")
-                    else:
-                        print("❌ TTS failed")
-                except Exception as e:
-                    print("❌ TTS error:", e)
-                    traceback.print_exc()
-                finally:
-                    ai_speaking.clear()
-                    ai_should_stop.clear()
-
-            ollama_queue.task_done()
-            
-        except Exception as e:
-            print("❌ LLM worker error:", e)
-            traceback.print_exc()
-            ai_speaking.clear()
+def llm_worker():
+    """Deprecated - processing is now synchronous"""
+    pass
 
 # -----------------------------
 # Thread health monitor
@@ -832,20 +838,14 @@ def thread_health_monitor():
 def main():
     global remote_addr, peer_fmt_pt
     print("=" * 60)
-    print("🎧 VOICE ASSISTANT - WORKING BUILD")
+    print("🎧 VOICE ASSISTANT - SIMPLIFIED")
     print(f"📡 Listening on {LISTEN_IP}:{LISTEN_PORT}")
     print("=" * 60)
 
     debug_startup_questions()
 
-    t_trans = threading.Thread(target=transcribe_worker, daemon=True, name="transcribe_worker")
-    t_llm = threading.Thread(target=llm_worker, daemon=True, name="llm_worker")
     t_monitor = threading.Thread(target=thread_health_monitor, daemon=True, name="thread_health_monitor")
-    t_trans.start()
-    t_llm.start()
     t_monitor.start()
-    register_thread("transcribe_worker", t_trans)
-    register_thread("llm_worker", t_llm)
     register_thread("thread_health_monitor", t_monitor)
 
     audio_accumulator = bytearray()
@@ -875,19 +875,11 @@ def main():
             except Exception as e:
                 print("❌ Failed to start rtp_keepalive_sender:", e)
                 traceback.print_exc()
-            # AI-generated greeting
-            time.sleep(0.2)
+            
+            # Send AI-generated greeting
+            time.sleep(0.3)
             if SPEAK_ASSISTANT:
-                try:
-                    print("👋 Generating AI greeting...")
-                    greeting_prompt = "[SYSTEM: User just connected. Generate a warm, brief greeting (1-2 sentences) introducing yourself and offering to help.]"
-                    ollama_queue.put_nowait(greeting_prompt)
-                    print("   ✅ Greeting queued to AI")
-                except Full:
-                    print("⚠️ AI queue full, couldn't send greeting")
-                except Exception as e:
-                    print("❌ Greeting queueing failed:", e)
-                    traceback.print_exc()
+                threading.Thread(target=send_greeting, daemon=True).start()
 
         pt, pcm8k, _ = decode_rtp(data)
         if pcm8k is None:
