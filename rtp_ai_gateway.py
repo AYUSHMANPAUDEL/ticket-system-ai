@@ -5,6 +5,15 @@ import audioop
 import whisper
 import os
 import warnings
+import requests
+import json
+import tempfile
+import wave
+try:
+    import win32com.client  # Windows SAPI for offline TTS
+    HAVE_SAPI = True
+except Exception:
+    HAVE_SAPI = False
 
 # Suppress noisy deprecation warning from audioop on Python 3.11+
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -17,9 +26,24 @@ RECOG_RATE = 16000       # Whisper expects 16kHz or higher
 WHISPER_TASK = "transcribe"   # "transcribe" or "translate"
 DUMP_INPUT_WAV = False         # set True to periodically save inbound audio
 
+# ---- Ollama configuration ----
+# Set to the Gemma model you installed. Adjust if actual tag differs.
+OLLAMA_MODEL = "gemma3:4b"      # e.g. gemma2:2b / gemma:7b / gemma3:4b
+OLLAMA_URL = "http://127.0.0.1:11434/api/chat"  # Default local API endpoint
+OLLAMA_STREAM = True             # Enable streaming responses for lower latency
+MAX_HISTORY_MESSAGES = 10        # Slightly reduced for smaller model context efficiency
+SYSTEM_PROMPT = (
+    "You are a concise, helpful real-time voice call assistant. "
+    "Keep answers short (1-2 sentences) unless user asks for detail. "
+    "Ask clarifying questions when uncertain. Avoid hallucinating call controls."
+)
+
+# ---- Assistant voice playback ----
+SPEAK_ASSISTANT = True           # If True, synthesize assistant replies to RTP audio (Windows SAPI)
+
 # RTP state
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.bind((LISTEN_IP, LISTEN_PORT))
+sock.bind((LISTEN_IP, LISTEN_PORT)) 
 sock.settimeout(1.0)
 
 remote_addr = None
@@ -27,6 +51,7 @@ peer_fmt_pt = None
 sent_hello = set()
 rtp_senders = {}
 keepalive_threads = {}
+injection_queues = {}  # peer_addr -> Queue of encoded RTP payload chunks (G.711)
 
 # ---------------------------
 # Whisper Model (local)
@@ -36,6 +61,13 @@ print(f"Loading Whisper model ({WHISPER_MODEL}, CPU, fp16 disabled)...")
 whisper_model = whisper.load_model(WHISPER_MODEL, device="cpu")
 transcribe_queue = Queue(maxsize=8)
 transcribe_lock = threading.Lock()  # guard model if needed
+
+# Queue for LLM turn-taking: user speech segments turned into chat messages
+ollama_queue = Queue(maxsize=16)
+
+# Conversation history: list of dicts {role: 'system'|'user'|'assistant', content: str}
+conversation_history = [{"role": "system", "content": SYSTEM_PROMPT}]
+history_lock = threading.Lock()
 
 # ---------------------------
 # Helper functions
@@ -151,7 +183,7 @@ def send_probe_tone(peer_addr, pt_hint: int = 0, freq: int = 1000, ms: int = 800
         print("Probe tone error:", e)
 
 def rtp_keepalive_sender(peer_addr, pt_hint: int = 0):
-    """Continuously send RTP silence frames (20ms) to maintain symmetric RTP and coax audio."""
+    """Continuously send RTP frames (speech if queued, else silence) to maintain path."""
     try:
         pt_to_send = 8 if pt_hint == 8 else 0
         pad_byte = b"\xD5" if pt_to_send == 8 else b"\xFF"
@@ -171,13 +203,26 @@ def rtp_keepalive_sender(peer_addr, pt_hint: int = 0):
         ssrc = st['ssrc']
         samples_per_packet = 160  # 20ms @8k
         silence_payload = pad_byte * samples_per_packet
+        # Ensure we have an injection queue for this peer
+        if peer_addr not in injection_queues:
+            injection_queues[peer_addr] = Queue(maxsize=400)
         while True:
             marker = 0
             b1 = (2 << 6)
             b2 = (marker << 7) | pt_to_send
+            # If we have injected audio, send that instead of silence
+            payload = None
+            try:
+                q = injection_queues.get(peer_addr)
+                if q is not None:
+                    payload = q.get_nowait()
+            except Exception:
+                payload = None
+            if payload is None:
+                payload = silence_payload
             hdr = struct.pack('!BBHII', b1, b2, seq & 0xFFFF, ts & 0xFFFFFFFF, ssrc & 0xFFFFFFFF)
             try:
-                sock.sendto(hdr + silence_payload, peer_addr)
+                sock.sendto(hdr + payload, peer_addr)
             except Exception:
                 pass
             seq = (seq + 1) & 0xFFFF
@@ -188,6 +233,97 @@ def rtp_keepalive_sender(peer_addr, pt_hint: int = 0):
             time.sleep(0.02)
     except Exception as e:
         print("keepalive error:", e)
+
+def resample_any_to_8k(pcm16_bytes: bytes, src_rate: int) -> bytes:
+    if not pcm16_bytes:
+        return b""
+    x = np.frombuffer(pcm16_bytes, dtype=np.int16).astype(np.float32)
+    if src_rate == 8000:
+        return pcm16_bytes
+    n_in = x.shape[0]
+    n_out = max(1, int(round(n_in * 8000.0 / float(src_rate))))
+    xp = np.linspace(0, n_in - 1, num=n_in, dtype=np.float32)
+    xnew = np.linspace(0, n_in - 1, num=n_out, dtype=np.float32)
+    y = np.interp(xnew, xp, x)
+    y = np.clip(np.round(y), -32768, 32767).astype(np.int16)
+    return y.tobytes()
+
+def enqueue_rtp_audio_from_pcm16(peer_addr, pcm16_bytes: bytes, src_rate: int, pt_hint: int = 0):
+    try:
+        if not pcm16_bytes or peer_addr is None:
+            return
+        pcm8k = resample_any_to_8k(pcm16_bytes, src_rate)
+        # Encode to G.711
+        if (pt_hint or 0) == 8:
+            enc = audioop.lin2alaw(pcm8k, 2)
+            pad = b"\xD5"
+            pt_to_send = 8
+        else:
+            enc = audioop.lin2ulaw(pcm8k, 2)
+            pad = b"\xFF"
+            pt_to_send = 0
+        # Split into 20ms frames (160 bytes each at 8k)
+        frame_len = 160
+        q = injection_queues.get(peer_addr)
+        if q is None:
+            q = Queue(maxsize=400)
+            injection_queues[peer_addr] = q
+        for i in range(0, len(enc), frame_len):
+            chunk = enc[i:i+frame_len]
+            if len(chunk) < frame_len:
+                chunk = chunk + pad * (frame_len - len(chunk))
+            try:
+                q.put_nowait(chunk)
+            except Full:
+                # Drop if queue is full to keep realtime
+                break
+    except Exception as e:
+        print("enqueue_rtp_audio error:", e)
+
+def tts_sapi_to_pcm16(text: str):
+    """Use Windows SAPI to synthesize text to WAV in a temp file and return PCM16 bytes and sample rate."""
+    if not HAVE_SAPI:
+        return None, None
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp_path = tmp.name
+    tmp.close()
+    try:
+        voice = win32com.client.Dispatch("SAPI.SpVoice")
+        stream = win32com.client.Dispatch("SAPI.SpFileStream")
+        # Open file stream for write
+        SpFileMode = 3  # SSFMCreateForWrite
+        stream.Open(tmp_path, SpFileMode, False)
+        voice.AudioOutputStream = stream
+        voice.Speak(text)
+        stream.Close()
+        # Read WAV
+        with wave.open(tmp_path, 'rb') as wf:
+            if wf.getsampwidth() != 2 or wf.getnchannels() != 1:
+                # Convert to mono16 in memory if needed
+                frames = wf.readframes(wf.getnframes())
+                sampwidth = wf.getsampwidth()
+                channels = wf.getnchannels()
+                rate = wf.getframerate()
+                # Convert arbitrary width/channels to mono16 PCM
+                pcm = frames
+                # If stereo, average channels using audioop
+                if channels == 2:
+                    pcm = audioop.tomono(pcm, sampwidth, 0.5, 0.5)
+                if sampwidth != 2:
+                    pcm = audioop.lin2lin(pcm, sampwidth, 2)
+                return pcm, rate
+            else:
+                rate = wf.getframerate()
+                data = wf.readframes(wf.getnframes())
+                return data, rate
+    except Exception as e:
+        print("tts_sapi error:", e)
+        return None, None
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
 
 def transcribe_worker():
     """Single worker thread that runs Whisper sequentially to avoid concurrency issues."""
@@ -229,11 +365,114 @@ def transcribe_worker():
                 if not is_hallucination:
                     tag = "Translation" if WHISPER_TASK == "translate" else "Transcription"
                     print(f"[Whisper {tag}]:", text)
+                    # Enqueue for LLM assistant
+                    try:
+                        ollama_queue.put_nowait(text)
+                    except Full:
+                        pass
         except Exception as e:
             print("Whisper worker error:", e)
         finally:
             transcribe_queue.task_done()
 
+def prune_history():
+    """Keep conversation history within MAX_HISTORY_MESSAGES (excluding system)."""
+    with history_lock:
+        # Keep system prompt at index 0, prune older user/assistant pairs
+        non_system = [m for m in conversation_history[1:]]
+        if len(non_system) > MAX_HISTORY_MESSAGES:
+            # remove earliest messages keeping more recent context
+            excess = len(non_system) - MAX_HISTORY_MESSAGES
+            del conversation_history[1:1+excess]
+
+def call_ollama(messages):
+    """Non-streaming call to Ollama (fallback)."""
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": messages,
+        "stream": False,
+    }
+    try:
+        r = requests.post(OLLAMA_URL, json=payload, timeout=60)
+        r.raise_for_status()
+        data = r.json()
+        if "message" in data and isinstance(data["message"], dict):
+            return data["message"].get("content", "")
+        return data.get("response", "")
+    except Exception as e:
+        return f"(LLM error: {e})"
+
+def call_ollama_stream(messages):
+    """Streaming call: accumulates chunks for faster first token latency."""
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": messages,
+        "stream": True,
+    }
+    try:
+        with requests.post(OLLAMA_URL, json=payload, timeout=120, stream=True) as r:
+            r.raise_for_status()
+            parts = []
+            for line in r.iter_lines():
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line.decode('utf-8'))
+                except Exception:
+                    continue
+                # Each chunk contains {message: {content: ...}, done: bool}
+                msg = obj.get("message")
+                if msg and isinstance(msg, dict):
+                    chunk = msg.get("content", "")
+                    if chunk:
+                        parts.append(chunk)
+                if obj.get("done"):
+                    break
+            return "".join(parts).strip()
+    except Exception as e:
+        return f"(LLM stream error: {e})"
+
+def llm_worker():
+    """Consume transcribed user segments and produce assistant replies via Ollama."""
+    while True:
+        user_text = ollama_queue.get()
+        try:
+            user_text = user_text.strip()
+            if not user_text:
+                continue
+            # Simple debouncing: ignore very short fragments (<3 chars)
+            if len(user_text) < 3:
+                continue
+            # Update history
+            with history_lock:
+                conversation_history.append({"role": "user", "content": user_text})
+                prune_history()
+                messages_snapshot = list(conversation_history)  # shallow copy
+            # Call Ollama
+            if OLLAMA_STREAM:
+                assistant_reply = call_ollama_stream(messages_snapshot).strip()
+            else:
+                assistant_reply = call_ollama(messages_snapshot).strip()
+            if assistant_reply:
+                print(f"[Assistant]: {assistant_reply}\n")
+                # Append assistant message
+                with history_lock:
+                    conversation_history.append({"role": "assistant", "content": assistant_reply})
+                    prune_history()
+                # Optionally synthesize and play over RTP
+                if SPEAK_ASSISTANT and remote_addr is not None:
+                    pcm, rate = tts_sapi_to_pcm16(assistant_reply)
+                    if pcm and rate:
+                        try:
+                            enqueue_rtp_audio_from_pcm16(remote_addr, pcm, rate, pt_hint=peer_fmt_pt or 0)
+                        except Exception as _e:
+                            print("TTS enqueue error:", _e)
+            else:
+                print("[Assistant]: (No response)\n")
+        except Exception as e:
+            print("LLM worker error:", e)
+        finally:
+            ollama_queue.task_done()
 # ---------------------------
 # RTP Listening Loop
 # ---------------------------
@@ -271,6 +510,8 @@ def main():
 
     # Start transcription worker
     threading.Thread(target=transcribe_worker, daemon=True).start()
+    # Start LLM worker
+    threading.Thread(target=llm_worker, daemon=True).start()
 
     last_enqueue_ts = time.time()
     last_silence_log = 0.0
