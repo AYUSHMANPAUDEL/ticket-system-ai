@@ -1,0 +1,323 @@
+"""
+Voice Conversation System with Recording
+Records both user and AI voices and saves as high-quality audio
+Type /save in terminal to save the conversation
+"""
+
+import speech_recognition as sr
+import pyttsx3
+import wave
+import numpy as np
+import threading
+import queue
+import time
+from datetime import datetime
+import sys
+import os
+import requests
+import json
+
+# Configuration
+OLLAMA_MODEL = "gemma3:4b"
+OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
+SAMPLE_RATE = 16000  # Standard audio quality
+CHANNELS = 1  # Mono
+SAMPLE_WIDTH = 2  # 16-bit audio
+
+# System Prompt - Customize this to change AI behavior
+SYSTEM_PROMPT = """You are a helpful voice assistant. Keep responses concise (2-3 sentences) and conversational."""
+
+class VoiceRecorder:
+    """Records and manages audio streams for both user and AI"""
+    
+    def __init__(self):
+        self.user_audio = []  # Store user audio chunks
+        self.ai_audio = []    # Store AI audio chunks
+        self.conversation_timeline = []  # [(timestamp, 'user'/'ai', audio_data)]
+        self.is_recording = True
+        self.lock = threading.Lock()
+        
+    def add_user_audio(self, audio_data, timestamp=None):
+        """Add user audio chunk with timestamp"""
+        if timestamp is None:
+            timestamp = time.time()
+        with self.lock:
+            self.user_audio.append(audio_data)
+            self.conversation_timeline.append((timestamp, 'user', audio_data))
+    
+    def add_ai_audio(self, audio_data, timestamp=None):
+        """Add AI audio chunk with timestamp"""
+        if timestamp is None:
+            timestamp = time.time()
+        with self.lock:
+            self.ai_audio.append(audio_data)
+            self.conversation_timeline.append((timestamp, 'ai', audio_data))
+    
+    def save_conversation(self, filename=None):
+        """Save the entire conversation as a single audio file"""
+        if filename is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"conversation_{timestamp}.wav"
+        
+        with self.lock:
+            if not self.conversation_timeline:
+                print("⚠️  No conversation to save!")
+                return None
+            
+            # Sort by timestamp to ensure correct order
+            sorted_timeline = sorted(self.conversation_timeline, key=lambda x: x[0])
+            
+            # Combine all audio chunks in chronological order exactly as recorded
+            combined_audio = []
+            
+            for timestamp, speaker, audio_data in sorted_timeline:
+                combined_audio.append(audio_data)
+            
+            # Merge all audio data
+            final_audio = b''.join(combined_audio)
+            
+            # Save directly without any modification
+            try:
+                with open(filename, 'wb') as f:
+                    f.write(final_audio)
+                
+                file_size = len(final_audio) / 1024  # KB
+                print(f"\n✅ Conversation saved: {filename}")
+                print(f"   File size: {file_size:.1f} KB")
+                print(f"   User segments: {len(self.user_audio)}")
+                print(f"   AI segments: {len(self.ai_audio)}")
+                return filename
+            except Exception as e:
+                print(f"❌ Error saving conversation: {e}")
+                return None
+
+
+class VoiceAssistant:
+    """Main voice assistant with recording capabilities"""
+    
+    def __init__(self, system_prompt=None):
+        self.recognizer = sr.Recognizer()
+        self.microphone = sr.Microphone()
+        self.tts_engine = pyttsx3.init()
+        self.recorder = VoiceRecorder()
+        self.conversation_history = []
+        self.running = True
+        self.system_prompt = system_prompt if system_prompt else SYSTEM_PROMPT
+        
+        # Configure TTS
+        self.tts_engine.setProperty('rate', 175)  # Speed
+        self.tts_engine.setProperty('volume', 0.9)  # Volume
+        
+        # Adjust for ambient noise
+        print("🎤 Calibrating microphone for ambient noise...")
+        with self.microphone as source:
+            self.recognizer.adjust_for_ambient_noise(source, duration=2)
+        print("✅ Calibration complete!")
+    
+    def listen_for_speech(self):
+        """Listen for user speech and return text"""
+        try:
+            with self.microphone as source:
+                print("\n🎤 Listening... (speak now)")
+                audio = self.recognizer.listen(source, timeout=5, phrase_time_limit=15)
+                
+                # Record the user audio
+                audio_data = audio.get_wav_data()
+                timestamp = time.time()
+                
+                # Convert to proper format and store
+                self.recorder.add_user_audio(audio_data, timestamp)
+                
+                # Recognize speech
+                print("🔄 Processing speech...")
+                text = self.recognizer.recognize_google(audio)
+                return text
+        except sr.WaitTimeoutError:
+            print("⏱️  No speech detected (timeout)")
+            return None
+        except sr.UnknownValueError:
+            print("❓ Could not understand audio")
+            return None
+        except sr.RequestError as e:
+            print(f"❌ Speech recognition error: {e}")
+            return None
+        except Exception as e:
+            print(f"❌ Error listening: {e}")
+            return None
+    
+    def speak(self, text):
+        """Convert text to speech and play it"""
+        try:
+            print(f"🤖 AI: {text}")
+            
+            # Create a temporary file to capture TTS audio
+            temp_wav = f"temp_tts_{time.time()}.wav"
+            
+            # Save TTS to file
+            self.tts_engine.save_to_file(text, temp_wav)
+            self.tts_engine.runAndWait()
+            
+            # Wait for file to be created
+            max_wait = 5
+            wait_time = 0
+            while not os.path.exists(temp_wav) and wait_time < max_wait:
+                time.sleep(0.1)
+                wait_time += 0.1
+            
+            if os.path.exists(temp_wav):
+                # Read the audio file exactly as is and store it
+                try:
+                    with open(temp_wav, 'rb') as f:
+                        audio_data = f.read()
+                        timestamp = time.time()
+                        
+                        # Store AI audio exactly as generated
+                        self.recorder.add_ai_audio(audio_data, timestamp)
+                    
+                    # Clean up temp file
+                    os.remove(temp_wav)
+                except Exception as e:
+                    print(f"⚠️  Could not read TTS audio: {e}")
+            
+            # Speak it out loud
+            self.tts_engine.say(text)
+            self.tts_engine.runAndWait()
+            
+        except Exception as e:
+            print(f"❌ Error in text-to-speech: {e}")
+    
+    def get_ai_response(self, user_input):
+        """Get response from Ollama LLM"""
+        try:
+            # Add user message to history
+            self.conversation_history.append({"role": "user", "content": user_input})
+            
+            # Prepare prompt
+            prompt_parts = []
+            prompt_parts.append(f"System: {self.system_prompt}")
+            
+            for msg in self.conversation_history[-6:]:  # Last 6 messages for context
+                role = msg.get("role", "")
+                content = msg.get("content", "")
+                if role == "user":
+                    prompt_parts.append(f"User: {content}")
+                elif role == "assistant":
+                    prompt_parts.append(f"Assistant: {content}")
+            
+            prompt = "\n\n".join(prompt_parts) + "\n\nAssistant:"
+            
+            # Call Ollama
+            payload = {
+                "model": OLLAMA_MODEL,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": 0.7,
+                    "num_predict": 100
+                }
+            }
+            
+            response = requests.post(OLLAMA_URL, json=payload, timeout=30)
+            response.raise_for_status()
+            
+            result = response.json()
+            ai_response = result.get("response", "").strip()
+            
+            # Add to history
+            self.conversation_history.append({"role": "assistant", "content": ai_response})
+            
+            return ai_response
+        except Exception as e:
+            print(f"❌ Error getting AI response: {e}")
+            return "I'm sorry, I encountered an error. Could you repeat that?"
+    
+    def check_for_save_command(self):
+        """Check for /save command in a separate thread"""
+        def input_checker():
+            while self.running:
+                try:
+                    cmd = input()
+                    if cmd.strip().lower() == "/save":
+                        print("\n💾 Saving conversation...")
+                        filename = self.recorder.save_conversation()
+                        if filename:
+                            print("✅ Save complete! You can continue talking or press Ctrl+C to exit.\n")
+                except EOFError:
+                    break
+                except Exception as e:
+                    print(f"⚠️  Input error: {e}")
+        
+        input_thread = threading.Thread(target=input_checker, daemon=True)
+        input_thread.start()
+    
+    def run(self):
+        """Main conversation loop"""
+        print("\n" + "=" * 70)
+        print("🎙️  VOICE CONVERSATION SYSTEM")
+        print("=" * 70)
+        print("📝 Instructions:")
+        print("   • Speak into your microphone when prompted")
+        print("   • Type '/save' in the terminal to save the conversation")
+        print("   • Press Ctrl+C to exit")
+        print("=" * 70)
+        print(f"\n🤖 System Prompt: {self.system_prompt}")
+        print("=" * 70 + "\n")
+        
+        # Start listening for save command
+        self.check_for_save_command()
+        
+        # Initial greeting
+        greeting = "Hello! I'm your AI assistant. How can I help you today?"
+        self.speak(greeting)
+        self.conversation_history.append({"role": "assistant", "content": greeting})
+        
+        try:
+            while self.running:
+                # Listen for user input
+                user_text = self.listen_for_speech()
+                
+                if user_text:
+                    print(f"👤 You: {user_text}")
+                    
+                    # Check for exit commands
+                    if user_text.lower() in ['exit', 'quit', 'goodbye', 'bye']:
+                        farewell = "Goodbye! Have a great day!"
+                        self.speak(farewell)
+                        break
+                    
+                    # Get AI response
+                    ai_response = self.get_ai_response(user_text)
+                    
+                    # Speak the response
+                    self.speak(ai_response)
+                else:
+                    time.sleep(0.5)
+        
+        except KeyboardInterrupt:
+            print("\n\n⚠️  Interrupted by user")
+        finally:
+            self.running = False
+            print("\n💾 Saving final conversation...")
+            self.recorder.save_conversation()
+            print("\n👋 Thank you for using the Voice Assistant!")
+
+
+def main():
+    """Main entry point"""
+    try:
+        # Check if custom system prompt is provided via command line
+        custom_prompt = None
+        if len(sys.argv) > 1:
+            custom_prompt = " ".join(sys.argv[1:])
+            print(f"\n✨ Using custom system prompt from command line")
+        
+        assistant = VoiceAssistant(system_prompt=custom_prompt)
+        assistant.run()
+    except Exception as e:
+        print(f"❌ Fatal error: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+if __name__ == "__main__":
+    main()
