@@ -49,8 +49,8 @@ WHISPER_TASK = "transcribe"
 WHISPER_MODEL = "base"
 
 # Ollama / local LLM streaming API
-OLLAMA_MODEL = "phi3:mini"
-OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
+OLLAMA_MODEL = "gemma3:4b"
+OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
 MAX_HISTORY_MESSAGES = 10
 
 SYSTEM_PROMPT = (
@@ -234,19 +234,24 @@ def process_audio_vad(pcm8k_bytes):
         if len(pcm8k_bytes) < VAD_FRAME_SAMPLES * 2:
             return
         current_time = time.time()
-        if ai_speaking.is_set():
+        
+        # Skip processing ONLY if AI is actively speaking AND not being interrupted
+        if ai_speaking.is_set() and not ai_should_stop.is_set():
             return
 
         # Check for prolonged user silence and prompt if needed
         silence_duration = current_time - last_user_activity_time
         if (silence_duration > USER_SILENCE_TIMEOUT and
             not is_speaking and
+            not ai_speaking.is_set() and
             current_time - last_silence_prompt_time > USER_SILENCE_TIMEOUT * 1.5 and
             remote_addr is not None):
             print(f"⏰ User silent for {silence_duration:.1f}s, prompting...")
             prompt_msg = SILENCE_PROMPT_MESSAGES[silence_prompt_index % len(SILENCE_PROMPT_MESSAGES)]
             silence_prompt_index += 1
             last_silence_prompt_time = current_time
+            # Reset user activity time to prevent immediate re-triggering
+            last_user_activity_time = current_time
             try:
                 print("[DEBUG] queueing silence prompt to ollama_queue:", prompt_msg)
                 ollama_queue.put_nowait(f"[SYSTEM: User has been silent. Say: '{prompt_msg}']")
@@ -266,7 +271,7 @@ def process_audio_vad(pcm8k_bytes):
                     silence_frame_count = 0
                     speech_buffer = []
                     last_user_activity_time = current_time
-                    print("\n🎤 User speaking...")
+                    print(f"\n🎤 User speaking... (RMS: {rms:.4f}, ai_speaking: {ai_speaking.is_set()})")
                     if ai_speaking.is_set():
                         ai_should_stop.set()
                         print("⏸️  [AI interrupted by user]")
@@ -661,9 +666,23 @@ def rtp_keepalive_sender(peer_addr, pt_hint=0):
 # Ollama call (streaming)
 # -----------------------------
 def call_ollama(messages, timeout=60):
+    # Convert messages to a single prompt string
+    prompt_parts = []
+    for msg in messages:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if role == "system":
+            prompt_parts.append(f"System: {content}")
+        elif role == "user":
+            prompt_parts.append(f"User: {content}")
+        elif role == "assistant":
+            prompt_parts.append(f"Assistant: {content}")
+    
+    prompt = "\n\n".join(prompt_parts) + "\n\nAssistant:"
+    
     payload = {
         "model": OLLAMA_MODEL,
-        "messages": messages,
+        "prompt": prompt,
         "stream": True,
         "options": {
             "temperature": 0.7,
@@ -687,15 +706,11 @@ def call_ollama(messages, timeout=60):
             try:
                 line = raw.decode() if isinstance(raw, bytes) else raw
                 j = json.loads(line)
-                chunk = ""
-                if "response" in j and j["response"]:
-                    chunk = j["response"]
-                elif "message" in j and isinstance(j["message"], dict):
-                    chunk = j["message"].get("content", "")
+                chunk = j.get("response", "")
                 if chunk:
                     assembled += chunk
                     print(f"🧩 [Ollama chunk] {chunk}", end="", flush=True)
-                if j.get("done") or j.get("done_reason") or j.get("final", False):
+                if j.get("done", False):
                     break
             except json.JSONDecodeError:
                 try:
@@ -712,7 +727,7 @@ def call_ollama(messages, timeout=60):
         print("❌ Ollama error:", e)
         traceback.print_exc()
         return ""
-    return assembled
+    return assembled.strip()
 
 def prune_history():
     with history_lock:
