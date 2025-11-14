@@ -22,6 +22,7 @@ import signal
 # Optional Windows SAPI
 try:
     import win32com.client
+    import pythoncom
     HAVE_SAPI = True
 except Exception:
     HAVE_SAPI = False
@@ -441,21 +442,27 @@ def tts_sapi_to_pcm16(text):
     tmp_path = tmp.name
     tmp.close()
     try:
-        voice = win32com.client.Dispatch("SAPI.SpVoice")
-        voice.Rate = 2
-        stream = win32com.client.Dispatch("SAPI.SpFileStream")
-        stream.Open(tmp_path, 3, False)
-        voice.AudioOutputStream = stream
-        voice.Speak(text)
-        stream.Close()
-        with wave.open(tmp_path, 'rb') as wf:
-            frames = wf.readframes(wf.getnframes())
-            sample_rate = wf.getframerate()
-            if wf.getnchannels() == 2:
-                frames = audioop.tomono(frames, wf.getsampwidth(), 0.5, 0.5)
-            if wf.getsampwidth() != 2:
-                frames = audioop.lin2lin(frames, wf.getsampwidth(), 2)
-            return frames, sample_rate
+        # Initialize COM for this thread
+        import pythoncom
+        pythoncom.CoInitialize()
+        try:
+            voice = win32com.client.Dispatch("SAPI.SpVoice")
+            voice.Rate = 2
+            stream = win32com.client.Dispatch("SAPI.SpFileStream")
+            stream.Open(tmp_path, 3, False)
+            voice.AudioOutputStream = stream
+            voice.Speak(text)
+            stream.Close()
+            with wave.open(tmp_path, 'rb') as wf:
+                frames = wf.readframes(wf.getnframes())
+                sample_rate = wf.getframerate()
+                if wf.getnchannels() == 2:
+                    frames = audioop.tomono(frames, wf.getsampwidth(), 0.5, 0.5)
+                if wf.getsampwidth() != 2:
+                    frames = audioop.lin2lin(frames, wf.getsampwidth(), 2)
+                return frames, sample_rate
+        finally:
+            pythoncom.CoUninitialize()
     except Exception as e:
         print(f"❌ SAPI TTS error: {e}")
         traceback.print_exc()
@@ -747,23 +754,66 @@ def llm_worker():
                     pass
                 continue
 
-            is_silence_prompt = user_text.startswith("[SYSTEM: User has been silent.")
-            if is_silence_prompt:
-                start_idx = user_text.find("Say: '") + 6
-                end_idx = user_text.rfind("']")
-                if start_idx > 5 and end_idx > start_idx:
-                    assistant_reply = user_text[start_idx:end_idx]
-                    print("\n" + "=" * 60)
-                    print(f"🔕 SILENCE DETECTED - Prompting user")
-                    print(f"🤖 AI: \"{assistant_reply}\"")
-                    print("=" * 60)
+            is_system_prompt = user_text.startswith("[SYSTEM:")
+            
+            if is_system_prompt:
+                # Handle system prompts (silence, greeting, etc.)
+                if "User has been silent." in user_text:
+                    # Extract predefined message from silence prompt
+                    start_idx = user_text.find("Say: '") + 6
+                    end_idx = user_text.rfind("']")
+                    if start_idx > 5 and end_idx > start_idx:
+                        assistant_reply = user_text[start_idx:end_idx]
+                        print("\n" + "=" * 60)
+                        print(f"🔕 SILENCE DETECTED - Prompting user")
+                        print(f"🤖 AI: \"{assistant_reply}\"")
+                        print("=" * 60)
+                    else:
+                        try:
+                            ollama_queue.task_done()
+                        except Exception:
+                            pass
+                        continue
                 else:
-                    try:
-                        ollama_queue.task_done()
-                    except Exception:
-                        pass
-                    continue
+                    # For other system prompts (like greeting), generate AI response
+                    print("\n" + "=" * 60)
+                    print(f"🎯 SYSTEM PROMPT: {user_text}")
+                    print("=" * 60)
+                    ai_should_stop.clear()
+                    audio_finish_event.clear()
+                    
+                    # Create a temporary message without adding to history
+                    temp_messages = list(conversation_history) + [{"role": "user", "content": user_text}]
+                    
+                    print("🤔 Generating AI response...")
+                    start_time = time.time()
+                    assistant_reply = call_ollama(temp_messages)
+                    elapsed = time.time() - start_time
+                    
+                    if ai_should_stop.is_set():
+                        print("🛑 Interrupted during thinking")
+                        try:
+                            ollama_queue.task_done()
+                        except Exception:
+                            pass
+                        continue
+                    
+                    if not assistant_reply:
+                        print("⚠️ Empty response from AI")
+                        try:
+                            ollama_queue.task_done()
+                        except Exception:
+                            pass
+                        continue
+                    
+                    print("\n" + "=" * 60)
+                    print(f"🤖 AI (system response): \"{assistant_reply.strip()}\"")
+                    print("=" * 60)
+                    print(f"   (LLM took {elapsed:.1f}s)")
+                    
+                    # Don't add system prompts to conversation history
             else:
+                # Regular user message
                 print("\n" + "=" * 60)
                 print(f"👤 USER: \"{user_text}\"")
                 print("=" * 60)
@@ -876,19 +926,6 @@ def thread_health_monitor():
             traceback.print_exc()
         time.sleep(10)
 
-def safe_llm_call(prompt):
-    try:
-        response = ollama.chat(model="llama3.2", messages=[{"role": "user", "content": prompt}])
-        txt = response.get("message", {}).get("content", "")
-        if not txt.strip():
-            print("[ERROR] LLM returned empty text!")
-            return "I'm here, but I didn't quite catch that."
-        return txt.strip()
-    except Exception as e:
-        print("[LLM ERROR]", e)
-        return "I had trouble generating a response."
-
-
 # -----------------------------
 # Main loop
 # -----------------------------
@@ -938,23 +975,18 @@ def main():
             except Exception as e:
                 print("❌ Failed to start rtp_keepalive_sender:", e)
                 traceback.print_exc()
-            # greeting
+            # AI-generated greeting
             time.sleep(0.2)
             if SPEAK_ASSISTANT:
                 try:
-                    print("👋 Sending greeting via TTS...")
-                    pcm, rate = text_to_speech("Hello! I'm ready to help. What can I do for you?")
-                    if pcm:
-                        ai_speaking.set()
-                        frames = enqueue_rtp_audio_from_pcm16(remote_addr, pcm, rate, peer_fmt_pt)
-                        if frames and frames > 0:
-                            time.sleep((frames * 0.02) + 0.5)
-                        ai_speaking.clear()
-                        print("   ✅ Greeting complete")
-                    else:
-                        print("⚠️ Greeting TTS failed")
+                    print("👋 Generating AI greeting...")
+                    greeting_prompt = "[SYSTEM: User just connected. Generate a warm, brief greeting (1-2 sentences) introducing yourself and offering to help.]"
+                    ollama_queue.put_nowait(greeting_prompt)
+                    print("   ✅ Greeting queued to AI")
+                except Full:
+                    print("⚠️ AI queue full, couldn't send greeting")
                 except Exception as e:
-                    print("❌ Greeting failed:", e)
+                    print("❌ Greeting queueing failed:", e)
                     traceback.print_exc()
 
         pt, pcm8k, _ = decode_rtp(data)
