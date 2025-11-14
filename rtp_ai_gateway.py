@@ -53,9 +53,9 @@ RECOG_RATE = 16000
 WHISPER_TASK = "transcribe"
 WHISPER_MODEL = "base"
 
-# Use the generate endpoint (streaming)
+# Use the chat endpoint (streaming)
 OLLAMA_MODEL = "phi3:mini"
-OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
+OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
 MAX_HISTORY_MESSAGES = 10
 
 SYSTEM_PROMPT = (
@@ -122,6 +122,14 @@ SILENCE_FRAMES = 15
 MIN_AUDIO_LENGTH_SEC = 0.4
 TRANSCRIBE_COOLDOWN = 0.3
 
+# Silence timeout configuration
+USER_SILENCE_TIMEOUT = 8.0  # seconds of total silence before prompting user
+SILENCE_PROMPT_MESSAGES = [
+    "Hello? Are you still there? I can't hear you.",
+    "I'm having trouble hearing you. Are you there?",
+    "Hey, I didn't catch that. Can you speak up?",
+]
+
 # -----------------------------
 # Global state
 # -----------------------------
@@ -139,6 +147,9 @@ speech_frame_count = 0
 silence_frame_count = 0
 is_speaking = False
 last_transcribe_time = 0
+last_user_activity_time = time.time()
+silence_prompt_index = 0
+last_silence_prompt_time = 0
 
 transcribe_queue = Queue(maxsize=8)
 transcribe_lock = threading.Lock()
@@ -211,11 +222,29 @@ def resample_any_to_8k(pcm16_bytes, src_rate):
 # -----------------------------
 def process_audio_vad(pcm8k_bytes):
     global speech_buffer, speech_frame_count, silence_frame_count, is_speaking, last_transcribe_time
+    global last_user_activity_time, silence_prompt_index, last_silence_prompt_time
     if len(pcm8k_bytes) < VAD_FRAME_SAMPLES * 2:
         return
     current_time = time.time()
     if ai_speaking.is_set():
         return
+    
+    # Check for prolonged user silence and prompt if needed
+    silence_duration = current_time - last_user_activity_time
+    if (silence_duration > USER_SILENCE_TIMEOUT and 
+        not is_speaking and 
+        current_time - last_silence_prompt_time > USER_SILENCE_TIMEOUT * 1.5 and
+        remote_addr is not None):
+        print(f"⏰ User silent for {silence_duration:.1f}s, prompting...")
+        prompt_msg = SILENCE_PROMPT_MESSAGES[silence_prompt_index % len(SILENCE_PROMPT_MESSAGES)]
+        silence_prompt_index += 1
+        last_silence_prompt_time = current_time
+        # Queue the prompt message
+        try:
+            ollama_queue.put_nowait(f"[SYSTEM: User has been silent. Say: '{prompt_msg}']")
+        except Full:
+            pass
+    
     for i in range(0, len(pcm8k_bytes), VAD_FRAME_SAMPLES * 2):
         frame = pcm8k_bytes[i:i + VAD_FRAME_SAMPLES * 2]
         if len(frame) < VAD_FRAME_SAMPLES * 2:
@@ -227,6 +256,7 @@ def process_audio_vad(pcm8k_bytes):
                 speech_frame_count = 0
                 silence_frame_count = 0
                 speech_buffer = []
+                last_user_activity_time = current_time  # Update activity time
                 print("\n🎤 User speaking...")
                 if ai_speaking.is_set():
                     ai_should_stop.set()
@@ -249,6 +279,7 @@ def process_audio_vad(pcm8k_bytes):
                                 try:
                                     transcribe_queue.put_nowait(audio_16k)
                                     last_transcribe_time = current_time
+                                    last_user_activity_time = current_time  # Update activity time
                                 except Full:
                                     print("⚠️  Transcription queue full, skipping...")
                             else:
@@ -511,7 +542,8 @@ def rtp_keepalive_sender(peer_addr, pt_hint=0):
             'seq': random.randint(0, 65535),
             'ts': random.randint(0, 2**32 - 1),
             'ssrc': random.randint(0, 2**32 - 1),
-            'pt': pt_hint
+            'pt': pt_hint,
+            'in_speech': False
         }
     st = rtp_senders[peer_addr]
     seq, ts, ssrc = st['seq'], st['ts'], st['ssrc']
@@ -523,6 +555,7 @@ def rtp_keepalive_sender(peer_addr, pt_hint=0):
     print(f"📡 RTP sender started for {peer_addr} (PT={pt_to_send}) SSRC={ssrc}")
     packets_sent = 0
     last_report = time.time()
+    silence_count = 0
     while True:
         if ai_should_stop.is_set() and ai_speaking.is_set():
             drained = 0
@@ -535,13 +568,26 @@ def rtp_keepalive_sender(peer_addr, pt_hint=0):
             if drained > 0:
                 print(f"🗑️ Drained {drained} frames due to interruption")
                 ai_speaking.clear()
+                st['in_speech'] = False
         try:
             payload = q.get(timeout=0.02)
             non_silence = True
+            silence_count = 0
         except Empty:
             payload = pad_byte * 160
             non_silence = False
-        header = struct.pack('!BBHII', 2 << 6, pt_to_send, seq & 0xFFFF, ts & 0xFFFFFFFF, ssrc)
+            silence_count += 1
+        
+        # Set marker bit on first packet of new speech
+        marker_bit = 0
+        if non_silence and not st['in_speech']:
+            marker_bit = 0x80  # Set marker bit
+            st['in_speech'] = True
+            print("🎯 Starting new audio sequence (marker bit set)")
+        elif not non_silence and silence_count > 25:  # ~500ms of silence
+            st['in_speech'] = False
+        
+        header = struct.pack('!BBHII', 2 << 6, pt_to_send | marker_bit, seq & 0xFFFF, ts & 0xFFFFFFFF, ssrc)
         try:
             sock.sendto(header + payload, peer_addr)
             packets_sent += 1
@@ -563,13 +609,12 @@ def rtp_keepalive_sender(peer_addr, pt_hint=0):
 # -----------------------------
 def call_ollama(messages, timeout=60):
     """
-    Use Ollama /api/generate streaming endpoint.
+    Use Ollama /api/chat streaming endpoint.
     'messages' is a list of dicts like {"role": "user","content":"..."} (system message first).
     We stream the response lines, print each chunk, and assemble a final reply string.
     """
     payload = {
         "model": OLLAMA_MODEL,
-        "prompt": None,   # not used when sending messages
         "messages": messages,
         "stream": True,
         "options": {
@@ -646,34 +691,50 @@ def llm_worker():
             if not user_text.strip():
                 print("⚠️ Empty message, skipping")
                 continue
-            print("\n" + "="*60)
-            print(f"👤 USER: \"{user_text}\"")
-            print("="*60)
-            ai_should_stop.clear()
-            audio_finish_event.clear()
-            with history_lock:
-                conversation_history.append({"role": "user", "content": user_text})
-                prune_history()
-                snapshot = list(conversation_history)
-            print(f"📚 [DEBUG] History snapshot length: {len(snapshot)}")
-            print("🤔 Thinking (Ollama)...")
-            start_time = time.time()
-            assistant_reply = call_ollama(snapshot)
-            elapsed = time.time() - start_time
-            if ai_should_stop.is_set():
-                print("🛑 Interrupted during thinking")
-                continue
-            if not assistant_reply:
-                print("⚠️ Empty response from AI")
-                continue
-            # Print final assistant reply
-            print("\n" + "="*60)
-            print(f"🤖 AI (final): \"{assistant_reply.strip()}\"")
-            print("="*60)
-            print(f"   (LLM took {elapsed:.1f}s)")
-            with history_lock:
-                conversation_history.append({"role": "assistant", "content": assistant_reply})
-                prune_history()
+            
+            # Check if this is a system silence prompt
+            is_silence_prompt = user_text.startswith("[SYSTEM: User has been silent.")
+            if is_silence_prompt:
+                # Extract the prompt message
+                start_idx = user_text.find("Say: '") + 6
+                end_idx = user_text.rfind("']")
+                if start_idx > 5 and end_idx > start_idx:
+                    assistant_reply = user_text[start_idx:end_idx]
+                    print("\n" + "="*60)
+                    print(f"🔕 SILENCE DETECTED - Prompting user")
+                    print(f"🤖 AI: \"{assistant_reply}\"")
+                    print("="*60)
+                else:
+                    continue
+            else:
+                print("\n" + "="*60)
+                print(f"👤 USER: \"{user_text}\"")
+                print("="*60)
+                ai_should_stop.clear()
+                audio_finish_event.clear()
+                with history_lock:
+                    conversation_history.append({"role": "user", "content": user_text})
+                    prune_history()
+                    snapshot = list(conversation_history)
+                print(f"📚 [DEBUG] History snapshot length: {len(snapshot)}")
+                print("🤔 Thinking (Ollama)...")
+                start_time = time.time()
+                assistant_reply = call_ollama(snapshot)
+                elapsed = time.time() - start_time
+                if ai_should_stop.is_set():
+                    print("🛑 Interrupted during thinking")
+                    continue
+                if not assistant_reply:
+                    print("⚠️ Empty response from AI")
+                    continue
+                # Print final assistant reply
+                print("\n" + "="*60)
+                print(f"🤖 AI (final): \"{assistant_reply.strip()}\"")
+                print("="*60)
+                print(f"   (LLM took {elapsed:.1f}s)")
+                with history_lock:
+                    conversation_history.append({"role": "assistant", "content": assistant_reply})
+                    prune_history()
             # TTS + RTP
             if SPEAK_ASSISTANT and remote_addr:
                 print(f"🔊 [DEBUG] Speech enabled; remote_addr={remote_addr}")
@@ -701,9 +762,19 @@ def llm_worker():
                     frames = 0
                 if frames > 0:
                     speech_duration = frames * 0.02
-                    wait_time = speech_duration + 1.0
+                    # Add extra buffer time to ensure audio plays completely
+                    wait_time = speech_duration + 1.5
                     print(f"✅ Playing (queued) {speech_duration:.1f}s of audio; waiting {wait_time:.1f}s for sender to transmit")
-                    time.sleep(wait_time)
+                    # Monitor the queue to ensure it empties
+                    start_wait = time.time()
+                    while time.time() - start_wait < wait_time:
+                        if remote_addr in injection_queues:
+                            qsize = injection_queues[remote_addr].qsize()
+                            if qsize == 0 and time.time() - start_wait > 0.5:
+                                print(f"✅ Audio queue emptied after {time.time() - start_wait:.1f}s")
+                                time.sleep(0.3)  # Small buffer after queue empty
+                                break
+                        time.sleep(0.1)
                     print("✅ Audio finished sending")
                 else:
                     print("⚠️ Failed to queue audio frames")
